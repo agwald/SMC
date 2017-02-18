@@ -1,0 +1,488 @@
+---
+title: 'SFO Delays: Midterm Report'
+author: "Amanda Grunwald"
+date: "February 17, 2017"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(root.dir='c:/Users/Amanda Grunwald/Documents/MSBA_quarter 2/R Programming/Github/akg4/Midterm 1/data/')
+knitr::opts_chunk$set(out.width='500px', dpi=150)
+```
+
+```{r, echo=FALSE, message=FALSE}
+#load libraries
+
+##ANOVA Analysis libraries
+library(reshape2) #to reshape data
+library(dplyr) #data preparation
+library(e1071) #Skew and kurtosis
+library(car) #Levenes test
+library(ggplot2) #plotting
+library(pander) #table formatting
+
+##LinearRegression libraries
+library(leaps) #exhaustive search
+library(broom) #residual analysis
+library(lmtest) #Durbin-Watson test
+
+
+#read csv file
+flightdata <- read.csv('On_Time_On_Time_Performance_2016_11.csv')
+flightdelay <- subset(flightdata, Origin=='SFO') #only take data related to SFO departures, only take data for delayed flights
+```
+
+#Introduction
+
+![San Francisco International Airport](https://cbssanfran.files.wordpress.com/2015/11/sfo.jpg?w=635)
+
+The national __[Bureau of Transportation Statistics](https://www.rita.dot.gov/bts/help/aviation/index.html)__ collects on-time data, as well as causes for delays and cancellations, from all of the major domestic carriers. As of 2016, 12 carriers meet the "major domestic carrier" criteria and are required to report their data:
+
++ AirTran Airways (FL)
++ Alaska Airlines (AS)
++ American Airlines (AA)
++ Delta Air Lines (DL)
++ Frontier Airlines (F9)
++ Hawaiian Airlines (HA)
++ JetBlue Airways (B6)
++ SkyWest Airlines (OO)
++ Southwest Airlines (WN)
++ United Airlines (UA)
++ US Airways (US)
++ Virgin America (VX)
+
+Using the data self-reported by these carriers, the scope of this project was limited to flight departures in November 2016 out of San Francisco International Airport (SFO). The objective of this project is threefold: 
+
+1. Describe the nature of flight delays
+2. Evaluate whether there is a significant difference between the carriers with respect to flight delay
+3. Explore whether there was sufficient data so as to predict arrival delay for flights originating out of SFO. 
+
+
+***
+
+
+#Question 1:
+###Report a descriptive statistics for the flight delay in San Francisco. What is the most common factor for a departure flight delay at the San Francisco airport?
+
+The .csv file with the flight data includes columns with the 5 causes for flight delay: air carrier, extreme weather, National Aviation System (NAS), late-arriving aircraft, and security. In order to standardize the table so that statistical analysis could be performed, I used the reshape2 package to melt the data. 
+
+
+```{r}
+
+#melt data to view data for factors related to flight delay
+flightdelay.m <- melt(flightdelay, id.vars=c("DayofMonth"), 
+                      measure.vars=c("CarrierDelay", 
+                                     "WeatherDelay", 
+                                     "NASDelay", 
+                                     "SecurityDelay",
+                                     "LateAircraftDelay"))
+```
+
+
+A descriptive statistics summary of the data yields the following insights:
+
+* __The leading cause of total delayed minutes was Late Aircraft Delay (64K minutes)__, followed by Carrier Delay (39K minutes), and NAS Delay (22K minutes). 
+* The maximum instance of delay: 472 minutes
+* The minimum instance of delay: 45 minutes
+* The kurtosis values were much higher than the recommended +/- 3
+* The skew values were much higher than the recommended +/- 1
+
+```{r, echo=FALSE}
+
+#Descriptive summary of melted data
+flightdelay.desc <- flightdelay.m %>%
+  group_by(variable) %>%
+  dplyr::summarise(
+    count=n(),
+    sum=sum(value, na.rm=TRUE),
+    min=min(value, na.rm=TRUE),
+    max=max(value, na.rm=TRUE),
+    mean=mean(value, na.rm=TRUE),
+    median=median(value, na.rm=TRUE),
+    range=max-min, 
+    q1=as.numeric(quantile(value, na.rm=TRUE) [2]), 
+    q3=as.numeric(quantile(value, na.rm=TRUE) [4]), 
+    iqr=q3-q1,
+    sd=sd(value, na.rm=TRUE), 
+    var=var(value, na.rm=TRUE), 
+    kurt=kurtosis(value, na.rm=TRUE), 
+    skew=skewness(value, na.rm=TRUE) 
+  )
+
+    
+#print descriptive data
+panderOptions("table.style", "simple")
+pander(subset(flightdelay.desc), row.names=FALSE)
+```
+
+A histogram of the delay data confirms, along with the high skew and kurtosis values, that the data set is not normal:
+
+```{r, echo=FALSE}
+#examine data for normality
+hist(flightdelay.m$value, xlab="Length of Delay (Minutes)", main="Length and Frequency of Delays at SFO", col="red")
+```
+
+A bar chart further illustrates the over-sized impact of late aircraft delays in comparison to other reasons:
+
+```{r, echo=FALSE}
+
+#bar chart
+colors = c("yellow", "green", "violet","orange", "cyan") 
+
+bp <- barplot(flightdelay.desc$sum, main="Cause of Delays (in minutes) at SFO, Nov. 2016", ylab="Total minutes of delay", xlab="Cause of delay", names.arg=c("Carrier", "Weather", "NAS", "Security", "LateCraft"), las=2, col=colors)
+```
+
+A box plot shows the common length of each delay, along with the outlier values:
+
+```{r, echo=FALSE}
+
+#box plot
+boxplot(flightdelay.m$value~flightdelay.m$variable, main="Reasons for SFO Departure Delays", ylab="Minutes", names.arg=c("Carrier", "Weather", "NAS", "Security", "LateCraft"), las=2, col=colors)
+```
+
+
+
+***
+
+#Question 2:
+###Is there a significant difference of delay between the carriers at the San Francisco airport for the provided month? If so, which carriers are better or worse?
+###Provide a complete analysis (e.g. hypothesis, assumptions checks, findings report, visualization etc.)
+
+
+Hypothesis testing will be used to determine if there is a significant difference of delay between the SFO carriers in November 2016. My initial hypothesis is:
+
+
++ H0: There is no difference between the average delay of the SFO carriers
++ H1: There is a difference with at least 1 carrier's average delay at SFO
+
+
+In order to test this hypothesis, a linear model must be fitted and then an analysis of variance (ANOVA) applied. 
+
+
+```{r, echo=FALSE}
+#ANOVA
+fit <- lm(data=flightdelay, DepDelayMinutes~Carrier)
+flightdelay.aov <- aov(fit)
+flightdelay.aov.summary <- summary(flightdelay.aov)
+
+#print results
+print(flightdelay.aov.summary)
+```
+
+In order to narrow down where the differences between carriers like, the Tukey-Kramer test is used. The test compares the differences between each of the carriers and provides a corresponding p-value. 
+
+```{r, echo=FALSE}
+
+#Tukey-Framer procedure, to create set of confidence intervals on the diffs btwn means of levels of a factor
+flightdelay.tukey <- TukeyHSD(flightdelay.aov)
+
+#print results
+print(flightdelay.tukey)
+```
+
+Based on the p-value calculations of the Tukey test, I can conclude that there are a number of carriers with statistically significant differences in average departure delays:
+
++ Delta-American Airlines: 0.014 _(p-value)_
++ Delta-JetBlue: 0.014 
++ SkyWest-Delta: 0.000
++ United-Delta: 0.000
++ Southwest-Delta: 0.000 
++ Virgin-SkyWest: 0.012
++ Southwest-Virgin: 0.001
+
+
+__In order to validate these results, an examination of the ANOVA's assumptions is necessary:__
+
+1. _The data is random and independent_
+
++ Given that departures occurred all throughout November at various times, I will assume that it is safe to treat this as random data. 
+
+2. _The data is normal_
+
++ An excellent way to test for normality is a Quantile-Quantile plot. This graphical tool helps illustrate weather or not the data is normal in its various quantiles. The plot, created using the ggplot2 library, sorts the data and compares their quantiles against eachother. If the data is normally distributed, then one can expect to see a normal distribution line. 
+
+```{r, echo=FALSE}
+
+
+#Create plot, save into var
+qqp <- ggplot(flightdelay) + stat_qq(aes(sample=DepDelayMinutes, colour=factor(Carrier))) + guides(col=guide_legend(title="Carriers"))
+
+print(qqp)
+
+```
+
+However, this plot shows that the data appears to be exponential, rather than normal. This is an important point and means that some of our analysis may not be accurate since normality is required for ANOVA.
+
+3. _The data has a homogeneous variance within the groups_
+
++ Homogenous variance is the assumption that all groups have the same or similar variance. This concept is important in relation to ANOVA's usage of the F statistic, which requires that group sizes are equal. If group sizes are unequal and if the variances are dissimilar, then the F statistic may falsely instruct to reject the null hypothesis (Type I error). 
+
++ The Levene Test is commonly used to test for variance by diverging the data for each group from the group mean, and then comparing the absolute values.
+
++ H0 = The variance in all groups is the same, H1 = At least 1 group has variance than differs from the rest of the groups. 
+
+```{r, echo=FALSE}
+
+#Homogeneity of variance
+flightdelay.levene <- leveneTest(fit)
+
+#print results
+print(flightdelay.levene)
+
+```
+
+The resulting p-value is practically zero, which means that Ican reject the null hypothesis and conclude that at least 1 group has variance that is statistically signifiant from the rest of the groups. 
+
+Therefore, the above assumption checks provide us with the following insight: Ihave reason to believe that the dataset is _not_ normally distributed (is perhaps exponential) and I have reason to believe that the variance among all groups is not the same. 
+
+Below is a plot of the ANOVA results so that Ican better visualize the results of this analysis:
+
+```{r, echo=F, warning=F}
+#Plot results of ANOVA
+df <- anova(fit)["DF",]
+names(df) <- c("between", "within")
+alpha <- 0.05
+
+#get F values
+flightdelay.f.crit <- qf(alpha, df[,"between"], df[,"within"], lower.tail = FALSE) #value is returning NA?
+flightdelay.f.value <- flightdelay.aov.summary[[1]]$F[1]
+
+#Plot boxplot of data set
+bp2 <- ggplot(flightdelay, aes(x=Carrier, y=DepDelayMinutes)) + stat_boxplot(geom="errorbar") + geom_boxplot() + labs(y="Minutes Delayed", x="Carriers")
+
+#print results
+print(bp2)
+```
+
+***
+
+#Question 3:
+###Is there evidence in the data that you can use to predict the amount of arrival delay when airplanes start from San Francisco airport?
+###Provide a complete analysis (e.g. hypothesis, assumptions checks, findings report, visualization etc.)
+
+Now that I better understand the nature of flight delays and the role that the carriers play, it would be interesting to try to predict late arrivals for flights originating from SFO. However, I must determine whether there is evidence in the data that can be used to predict arrival delay. Here are some of the factors that could be related to flight delays (both arrivals and departures):
+
+* __Day of the week:__ perhaps certain days have heavier air traffic than others, i.e. weekdays for business commuters or Friday evenings for vacationers
+
+* __Day of the month:__ given that this data is for November 2016, the role of national holidays (Veteran's Day and Thanksgiving) may certainly contribute to delays
+
+* __Departure time:__ this may be a good proxy for weather given that the San Francisco Bay Area is known for heavy fog, particularly in the early morning hours
+
+* __Airline ID:__ as shown before, not all carrier delays are equal so specific carriers may be predictive of delayed arrivals
+
+* __Distance:__ a flight that must travel very far (distance in miles) will likely have an even later arrival time
+
+* __Destination airport ID:__ flights arrive late not only because of problems at the departure airport, but also delays (weather, security, air traffic, etc.) at the arrival airport
+
+
+With the above variables in mind, I will conduct a linear regression to test my initial hypothesis:
+
++ H0: The data points available can be used to predict arrival delay (yes, evidence)
++ H1: The data points available cannot be used to predict arrival delay (no evidence)
+
+_-Assumptions: data for November is representative of other months in the year_
+
+The first step in developing the linear model is to create a dataframe that only contains the dependent variable (arrival delay) and the independent variables (listed above). 
+
+```{r, echo=T}
+#Create a dataframe with only the relevant variables
+flightarrival <- data.frame(flightdelay$ArrDelayMinutes, 
+                            flightdelay$DayOfWeek,
+                            flightdelay$DayofMonth, 
+                            flightdelay$DepTime, 
+                            flightdelay$AirlineID, 
+                            flightdelay$Distance,
+                            flightdelay$DestAirportID)
+
+#see the data to verify that it looks correct
+names(flightarrival)
+```
+
+Next, I will run the linear regression model and plot the results of the model:
+
+```{r, echo=t}
+#Run the regression analysis
+#Calculate regression on all data
+flightarrival.m1 <- lm(flightdelay.ArrDelayMinutes~., data=flightarrival) #1st model w/all vars
+flightarrival.m1.summary <- summary(flightarrival.m1) #results of 1st model
+plot(flightarrival.m1)
+```
+
+
+Let us evaluate the confidence interval of the linear model to better understand the value of the data provided. The results show that the 95% confidence intervals for mean arrival delay given the various factors below:
+
+
+```{r, echo=F}
+#Confidence interval
+flightarrival.m1.confint <- confint(flightarrival.m1)
+panderOptions("table.style", "simple")
+pander(subset(flightarrival.m1.confint), row.names=FALSE)
+```
+
+
+Let us also evaluate the correlation between all of the independent variables included in the model:
+
+
+```{r, echo=F}
+#Omit NA values
+flightarrival.na <- na.omit(flightarrival) #NA values create errors
+#Correlation matrix, using the table with omitted NA values
+flightarrival.cor <- cor(flightarrival.na)
+panderOptions("table.style", "simple")
+pander(subset(flightarrival.cor), row.names=FALSE)
+```
+
+
+The correlation matrix does not show any clear relationships between any of the variables. The greatest positive correlation is ~0.074 and the greatest negative correlation is -0.4, which is just a fraction above having no correlation whatsoever. The top 2 variable relationships with the _greatest positive correlation_ are:
+
++ Arrival delay and departure time: 0.074
++ Arrival delay and day of week: 0.070
+
+The top 2 relationships with the _greatest negative correlation_ are:
+
++ Distance and destination airport: -0.40
++ Distance and depature time: -0.08
+
+In order to drill down, I can look at the change in the regression model if I add variables one by one:
+
+```{r, echo=T}
+#Calculate all possible regressions
+x <- flightarrival.na[2:7] #using data with na.omit to avoid NA/NaN issue in leaps call
+y <- flightarrival.na[,1]
+
+#Model selection by exhaustive search
+flightarrival.out <- summary(regsubsets(x, y, nbest=2, nvmax=ncol(x)))
+flightarrival.regtab <- cbind(flightarrival.out$which, flightarrival.out$rsq, flightarrival.out$adjr2, flightarrival.out$cp)
+colnames(flightarrival.regtab) <- c("(Intercept", 
+                                    "DayofWeek", 
+                                    "DayofMonth", 
+                                    "DepTime", 
+                                    "AirlineID", 
+                                    "Dist", 
+                                    "DestAirportID", 
+                                    "R-sq", 
+                                    "R-sq (adj)", 
+                                    "Cp")
+print(flightarrival.regtab)
+```
+
+The results, however, do not point to any single variable that accounts for a significant percentage of the model's variability. The R-sq (adjusted) values are all very small (< 0.05) and the Mallow's CP values are quite high across all variables.
+
+Nonetheless, I chose 2 of the most relevant variables: Day of Week and Departure Time. 
+
+```{r, echo=T, eval=F}
+##Create 2nd model
+flightarrival.m2 <- lm(flightdelay.ArrDelayMinutes~flightdelay.DayOfWeek+flightdelay.DepTime, data=flightarrival)
+flightarrival.m2.summary <- summary(flightarrival.m2)
+print(flightarrival.m2.summary)
+#plot(flightarrival.m2)
+
+#Confidence intervals
+flightarrival.m2.confint <- confint(flightarrival.m2)
+panderOptions("table.style", "simple")
+pander(flightarrival.m2.confint), row.names=FALSE)
+```
+
+
+Yet, when I attempted to compare the 2 models, I ran into errors related to infinity and NULL return values. These appear to be symptomatic of some of oddities in this data set: non-normal data, no strong correlations, very low model accuracy. 
+
+
+Moving forward with the original model created, I then checked assumptions to be sure that the model is fulfulling the following expections:
+
+* Linearity
+* Normality
+* Equal variance
+* Independence
+* Outlier influence
+
+####Linearity  
+Residual vs. Fitted Plot
+
+```{r, echo=F}
+##Check assumptions
+#Create data frame with residuals
+flightarrival.f <- fortify(flightarrival.m1)
+
+p1 <- ggplot(flightarrival.f, aes(x=.fitted, y=.resid))+
+  geom_point() +
+  stat_smooth(method="loess") +
+  geom_hline(yintercept=0, col="red", linetype="dashed") +
+  xlab("Fitted values") +
+  ylab("Residuals") +
+  ggtitle("Residual vs Fitted Plot")
+
+print(p1)
+```
+
+####Normality
+Normal Q-Q Plot
+
+```{r, echo=F}
+p2 <- ggplot(flightarrival.f, aes(x=qqnorm(.stdresid, plot.it=FALSE)[[1]], y=.stdresid)) +
+  geom_point(na.rm=TRUE) +
+  geom_abline() +
+  xlab("Theoretical Quantiles") +
+  ylab("Standardized Residuals") +
+  ggtitle("Normal Q-Q")
+
+print(p2)
+```
+```{r, echo=T}
+flightarrival.skew <- skewness(flightarrival.f$.resid)
+print(flightarrival.skew)
+
+flightarrival.kurt <- kurtosis(flightarrival.f$.resid)
+print(flightarrival.kurt)
+```
+
+####Equal Variance
+```{r, echo=F}
+p3 <- ggplot(flightarrival.f, aes(x=.fitted, y=sqrt(abs(.stdresid)))) +
+  geom_point(na.rm=TRUE) +
+  stat_smooth(method="loess", na.rm=TRUE) +
+  xlab("Fitted Value") +
+  ylab(expression(sqrt("Standardized Residuals"))) +
+  ggtitle("Scales-Location")
+print(p3)
+```
+
+####Independence
+Conduct the Durbin-Watson test. 
+```{r, echo=F}
+#Independence - Durbin-Watson test
+flightarrival.dw <- dwtest(flightarrival.m1)
+print(flightarrival.dw)
+```
+
+####Outlier Influence
+Cook's distance histogram
+```{r, echo=F}
+p4 <- ggplot(flightarrival.f, aes(x=seq_along(.cooksd), y=.cooksd)) +
+  geom_bar(stat="identity", position="identity") +
+  xlab("Obs. Number") +
+  ylab("Cook's distance") +
+  ggtitle("Cook's distance")
+print(p4)
+
+p5 <- ggplot(flightarrival.f, aes(x =.hat, y = .stdresid)) +
+  geom_point(aes(size=.cooksd), na.rm=TRUE) +
+  stat_smooth(method="loess", na.rm=TRUE) +
+  xlab("Leverage") +
+  ylab("Standardized Residuals") +
+  ggtitle("Residual vs Leverage Plot") +
+  scale_size_continuous("Cook's Distance", range = c(1,5)) +
+  theme(legend.position="bottom")
+print(p5)
+```
+
+
+#Conclusion
+Returning to the original objective of this project, I sought to explain the primary cause for departure delays, the differences in carrier delays, and how we could predict arrival delay using the data reported to the Bureau of Transportation Statistics. 
+
++ __With regard to the first objective, the data informs us that the primary cause of delay is Late Aircraft arrival by a significant margin.__ This speaks to the type of air travel occurring to and from SFO. Given that it's a large West-coast hub with easy access to both Asia and the continential United States, one can imagine that there are many connecting flights and interdependent schedules. Therefore, a delay in an earlier flight elsewhere in the world would undoubtedly impact the on-time performance of flights set to depart from SFO. 
+
++ __With regard to the second objective, the data informs us that there are some differences between carriers and their reported delays. Those with average delays significantly different from the population were: Delta, Virgin, Southwest and SkyWest.__ Of these airlines, the commonality is that they are primarily low-budget, high volume carriers that fly to a variety of destinations. They schedule their flights on a tight timeline in order to minimize costs, as well. Thus, it is intuitive that these carriers have greater delays over specialty or higher-end carriers. 
+
++ __With regard to the final objective, the data could be used to try and predict arrival delay but the results are neither conclusive nor strong.__ Hence, this particular variables provided in this dataset are not useful for predictive modeling purposes. 
+
+
+Interesting options for further research would be to examine data over a period of several months rather than just one, to include data for other origins, or to try and normalize the dataset so that our analysis would be more significant. 
